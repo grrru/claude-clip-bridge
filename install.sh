@@ -136,36 +136,50 @@ deploy_remote_binary() {
 	remote_token="$remote_state_dir/token"
 	local_sha=$(cat "$REMOTE_SHA_FILE")
 
-	run ssh \
+	if [ "$DRY_RUN" -eq 1 ]; then
+		info "[dry-run] deploy to $host: xclip binary + token"
+		return 0
+	fi
+
+	ctl_path=$(mktemp -u "/tmp/ccb-ctl-$host-XXXXXX")
+
+	# Open a persistent master connection (single TCP handshake for all operations)
+	ssh \
 		-F "$BASE_SSH_CONFIG" \
 		-o PermitLocalCommand=no \
 		-o ClearAllForwardings=yes \
-		-o ControlMaster=no \
-		-o ControlPath=none \
-		"$host" \
-		"mkdir -p '$REMOTE_BIN_DIR' '$remote_state_dir'"
-	run scp \
-		-F "$BASE_SSH_CONFIG" \
-		-o ClearAllForwardings=yes \
-		-o ControlMaster=no \
-		-o ControlPath=none \
-		"$REMOTE_ARTIFACT" \
-		"$host:$remote_bin"
-	run scp \
-		-F "$BASE_SSH_CONFIG" \
-		-o ClearAllForwardings=yes \
-		-o ControlMaster=no \
-		-o ControlPath=none \
-		"$TOKEN_FILE" \
-		"$host:$remote_token"
-	run ssh \
-		-F "$BASE_SSH_CONFIG" \
-		-o PermitLocalCommand=no \
-		-o ClearAllForwardings=yes \
-		-o ControlMaster=no \
-		-o ControlPath=none \
-		"$host" \
-		"chmod 755 '$remote_bin' && chmod 600 '$remote_token' && printf '%s\n' '$local_sha' > '$remote_sha'"
+		-o ControlMaster=yes \
+		-o ControlPath="$ctl_path" \
+		-o ControlPersist=yes \
+		-fN \
+		"$host"
+
+	cleanup_ctl() { ssh -O exit -o ControlPath="$ctl_path" "$host" 2>/dev/null || true; }
+	trap cleanup_ctl EXIT INT TERM
+
+	ssh_ctl() {
+		ssh -F "$BASE_SSH_CONFIG" \
+			-o PermitLocalCommand=no \
+			-o ClearAllForwardings=yes \
+			-o ControlMaster=no \
+			-o ControlPath="$ctl_path" \
+			"$@"
+	}
+	scp_ctl() {
+		scp -F "$BASE_SSH_CONFIG" \
+			-o ClearAllForwardings=yes \
+			-o ControlMaster=no \
+			-o ControlPath="$ctl_path" \
+			"$@"
+	}
+
+	run ssh_ctl "$host" "mkdir -p '$REMOTE_BIN_DIR' '$remote_state_dir'"
+	run scp_ctl "$REMOTE_ARTIFACT" "$host:$remote_bin"
+	run scp_ctl "$TOKEN_FILE" "$host:$remote_token"
+	run ssh_ctl "$host" "chmod 755 '$remote_bin' && chmod 600 '$remote_token' && printf '%s\n' '$local_sha' > '$remote_sha'"
+
+	cleanup_ctl
+	trap - EXIT INT TERM
 }
 
 write_host_fragment() {
@@ -187,7 +201,9 @@ Host $host
     PermitLocalCommand yes
     LocalCommand $include_local_command
     RemoteForward $BRIDGE_PORT localhost:$BRIDGE_PORT
-    ExitOnForwardFailure yes
+    ExitOnForwardFailure no
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
 EOF
 }
 
